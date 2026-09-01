@@ -6,12 +6,13 @@
     <UseWindowsForms>true</UseWindowsForms>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
-    <!-- QBFC is in-process COM; its registered build is 32-bit, so the agent
-         process bitness MUST be x86 or Type.GetTypeFromProgID finds nothing. -->
-    <PlatformTarget>x86</PlatformTarget>
-    <Platforms>x86</Platforms>
+    <!-- QBFC is in-process COM and the agent's bitness MUST match the
+         registered QBFC build: QuickBooks Desktop 2021 and earlier register
+         32-bit QBFC, 2022+ (64-bit QB) register 64-bit. We build AnyCPU and
+         publish BOTH win-x86 and win-x64 — run whichever matches the QB on
+         the machine (the error message says which to try). -->
     <AssemblyName>VoltixQbAgent</AssemblyName>
-    <Version>0.1.0</Version>
+    <Version>0.1.1</Version>
     <Description>Voltix QuickBooks Enterprise Desktop sync agent</Description>
   </PropertyGroup>
 

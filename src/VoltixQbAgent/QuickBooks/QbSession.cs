@@ -45,11 +45,14 @@ public sealed class QbSession : IDisposable
     public static QbSession Open(string? companyFile = null)
     {
         var session = new QbSession();
+        var step = "create QBFC session manager";
         try
         {
             session._manager = CreateSessionManager();
+            step = "OpenConnection2";
             session._manager!.OpenConnection2("", AppName, CtLocalQBD);
             session._connectionOpen = true;
+            step = "BeginSession";
             session._manager.BeginSession(companyFile ?? "", OmDontCare);
             session._sessionOpen = true;
 
@@ -66,6 +69,9 @@ public sealed class QbSession : IDisposable
         catch (Exception ex)
         {
             session.Dispose();
+            Log.Warn($"QB open failed at step \"{step}\" " +
+                     $"(hr=0x{unchecked((uint)ex.HResult):X8}, {ex.GetType().Name}: {ex.Message}, " +
+                     $"process={(Environment.Is64BitProcess ? "x64" : "x86")})");
             throw Translate(ex);
         }
     }
@@ -105,19 +111,38 @@ public sealed class QbSession : IDisposable
 
     private static dynamic CreateSessionManager()
     {
+        var bitness = Environment.Is64BitProcess ? "x64" : "x86";
+        Exception? lastCreateError = null;
         for (var v = 17; v >= 13; v--)
         {
             var type = Type.GetTypeFromProgID($"QBFC{v}.QBSessionManager");
-            if (type != null)
+            if (type == null) continue;
+            try
             {
-                Log.Info($"Using QBFC{v}");
-                return Activator.CreateInstance(type)
-                       ?? throw new QbAgentException($"Could not instantiate QBFC{v}.QBSessionManager.");
+                var instance = Activator.CreateInstance(type)
+                    ?? throw new QbAgentException($"QBFC{v}.QBSessionManager returned null.");
+                Log.Info($"Using QBFC{v} ({bitness} process)");
+                return instance;
+            }
+            catch (Exception ex) when (ex is not QbAgentException)
+            {
+                // ProgID registered but the server won't instantiate in THIS
+                // process — almost always a bitness mismatch (64-bit QB 2022+
+                // registers 64-bit QBFC; older QB registers 32-bit).
+                lastCreateError = ex;
+                Log.Warn($"QBFC{v} found but failed to instantiate in this {bitness} process " +
+                         $"(hr=0x{unchecked((uint)ex.HResult):X8}: {ex.Message})");
             }
         }
+        var other = Environment.Is64BitProcess ? "x86" : "x64";
         throw new QbAgentException(
-            "The QuickBooks SDK (QBFC 13-17) is not installed on this machine, " +
-            "or the agent is not running as 32-bit.");
+            lastCreateError != null
+                ? $"QBFC is registered but cannot load in a {bitness} process — your QuickBooks is likely " +
+                  $"{(Environment.Is64BitProcess ? "32-bit (2021 or older)" : "64-bit (2022 or newer)")}. " +
+                  $"Run the {other} build of this agent instead."
+                : "The QuickBooks SDK (QBFC 13-17) is not registered on this machine. Is this the VM where " +
+                  "QuickBooks is installed? If so, install the QBFC redistributable from the QB SDK.",
+            lastCreateError);
     }
 
     /// <summary>HRESULT → human message, table lifted from the proven app.</summary>

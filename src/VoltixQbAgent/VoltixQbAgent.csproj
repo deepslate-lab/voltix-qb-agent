@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- QBFC is in-process COM; its registered build is 32-bit, so the agent
+         process bitness MUST be x86 or Type.GetTypeFromProgID finds nothing. -->
+    <PlatformTarget>x86</PlatformTarget>
+    <Platforms>x86</Platforms>
+    <AssemblyName>VoltixQbAgent</AssemblyName>
+    <Version>0.1.0</Version>
+    <Description>Voltix QuickBooks Enterprise Desktop sync agent</Description>
+  </PropertyGroup>
+
+</Project>

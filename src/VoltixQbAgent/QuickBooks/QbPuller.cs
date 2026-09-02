@@ -58,6 +58,35 @@ public static class QbPuller
         return (string.IsNullOrEmpty(id) ? null : id, remaining);
     }
 
+    /// <summary>QB writes request outcomes as ATTRIBUTES on the *QueryRs
+    /// element — a rejected request is an "empty" response with an Error
+    /// status, not an exception. Ignoring this is how a pull can silently
+    /// report 0 rows.</summary>
+    private static (string Severity, string Code, string Message) ReadRsStatus(string xml)
+    {
+        var doc = XDocument.Parse(xml);
+        var rs = doc.Descendants().FirstOrDefault(e => e.Name.LocalName.EndsWith("QueryRs"));
+        return (
+            rs?.Attribute("statusSeverity")?.Value ?? "Info",
+            rs?.Attribute("statusCode")?.Value ?? "0",
+            rs?.Attribute("statusMessage")?.Value ?? ""
+        );
+    }
+
+    /// <summary>One plain unchunked query with status checking.</summary>
+    private static ChunkedResult PullFull(QbSession session, string entity)
+    {
+        var xml = BuildQueryXml(session, entity);
+        var status = ReadRsStatus(xml);
+        if (status.Severity == "Error")
+        {
+            return new ChunkedResult(new List<Dictionary<string, object?>>(), null,
+                $"QuickBooks rejected the query (status {status.Code}): {status.Message}");
+        }
+        var parsed = Parse(entity, xml);
+        return new ChunkedResult(parsed.Rows, parsed.MaxModified, null);
+    }
+
     /// <summary>
     /// Pull an entity in iterator chunks inside ONE session (iterators are
     /// session-scoped). Small responses avoid the giant-response encoding
@@ -71,6 +100,12 @@ public static class QbPuller
     /// </summary>
     public static ChunkedResult PullChunked(QbSession session, string entity, Action<string> log)
     {
+        // AccountQueryRq does not support iterators at all — plain query.
+        if (entity == "accounts")
+        {
+            return PullFull(session, entity);
+        }
+
         var all = new List<Dictionary<string, object?>>();
         DateTimeOffset? max = null;
         string? iteratorId = null;
@@ -105,23 +140,44 @@ public static class QbPuller
                 return new ChunkedResult(all, max, message);
             }
 
+            // A rejected request is an EMPTY response with an Error status,
+            // not an exception — check before trusting the row count.
+            var status = ReadRsStatus(xml);
+            if (status.Severity == "Error")
+            {
+                if (iteratorId is null)
+                {
+                    // First chunk rejected (iterator form not accepted here) —
+                    // fall back to the plain unchunked query.
+                    log($"Pull {entity}: chunked query rejected (status {status.Code}: {status.Message}) — falling back to one full query.");
+                    return PullFull(session, entity);
+                }
+                var message = $"chunk {chunkIndex} (after {all.Count} records) rejected by QuickBooks (status {status.Code}): {status.Message}";
+                log($"Pull {entity}: {message}");
+                return new ChunkedResult(all, max, message);
+            }
+
             var parsed = Parse(entity, xml);
             all.AddRange(parsed.Rows);
             if (parsed.MaxModified.HasValue && (!max.HasValue || parsed.MaxModified > max)) max = parsed.MaxModified;
 
             var (nextId, remaining) = ReadIteratorAttrs(xml);
+            if (chunkIndex == 1)
+            {
+                log($"Pull {entity}: chunk 1 -> {parsed.Rows.Count} rows, status {status.Code}, iterator {(nextId != null ? $"active ({remaining} remaining)" : "none")}.");
+            }
 
             if (iteratorId is null && nextId is null)
             {
-                // No iterator support detected. If we clearly got a truncated
-                // first page, redo as a single unchunked query — never trust
-                // MaxReturned without an iterator to continue from.
-                if (parsed.Rows.Count >= ChunkSize)
+                // No iterator support detected. Never trust MaxReturned
+                // without an iterator to continue from: a full first page is
+                // clearly truncated, and an EMPTY first page is just as
+                // suspicious (a misunderstood iterator flag can yield 0 rows
+                // with status 0) — verify either way with one plain query.
+                if (parsed.Rows.Count >= ChunkSize || parsed.Rows.Count == 0)
                 {
-                    log($"Pull {entity}: iterator not supported here — falling back to one full query.");
-                    var fullXml = BuildQueryXml(session, entity);
-                    var full = Parse(entity, fullXml);
-                    return new ChunkedResult(full.Rows, full.MaxModified, null);
+                    log($"Pull {entity}: iterator inactive ({parsed.Rows.Count} rows in chunk 1) — verifying with one full query.");
+                    return PullFull(session, entity);
                 }
                 return new ChunkedResult(all, max, null);
             }

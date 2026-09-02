@@ -153,7 +153,7 @@ public sealed class AgentLoop
                 using var session = QbSession.Open(
                     string.IsNullOrWhiteSpace(_config.CompanyFilePath) ? null : _config.CompanyFilePath);
                 session.NegotiateQbXmlVersion();
-                return QbPuller.PullChunked(session, entity, Log.Info);
+                return QbPuller.PullResilient(session, entity, Log.Info);
             });
             if (error != null) throw new QbAgentException(error);
 

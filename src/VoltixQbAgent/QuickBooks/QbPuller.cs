@@ -21,9 +21,13 @@ public static class QbPuller
     /// without advancing the watermark.</summary>
     public sealed record ChunkedResult(List<Dictionary<string, object?>> Rows, DateTimeOffset? MaxModified, string? Error);
 
-    private const int ChunkSize = 100;
-    private const int ItContinue = 0; // ENIteratorType
-    private const int ItStart = 1;
+    // ENIteratorType numeric values are undocumented for late binding and we
+    // guessed wrong once (QB treated 1 as "Continue" — status 3150 asked for
+    // the missing iteratorID). Empirically: 1 = Continue; Start is probed at
+    // runtime from the remaining candidates and cached for the process.
+    private const int ItContinue = 1;
+    private static readonly int[] ItStartCandidates = { 2, 0 };
+    private static int? _itStartValue;
 
     private static dynamic AppendQuery(dynamic msgSet, string entity) => entity switch
     {
@@ -73,18 +77,28 @@ public static class QbPuller
         );
     }
 
-    /// <summary>One plain unchunked query with status checking.</summary>
-    private static ChunkedResult PullFull(QbSession session, string entity)
+    /// <summary>One plain unchunked query with status checking. Never throws —
+    /// a giant-response serializer crash (the UTFDataFormatException family)
+    /// comes back as an error result instead.</summary>
+    private static ChunkedResult PullFullSafe(QbSession session, string entity)
     {
-        var xml = BuildQueryXml(session, entity);
-        var status = ReadRsStatus(xml);
-        if (status.Severity == "Error")
+        try
+        {
+            var xml = BuildQueryXml(session, entity);
+            var status = ReadRsStatus(xml);
+            if (status.Severity == "Error")
+            {
+                return new ChunkedResult(new List<Dictionary<string, object?>>(), null,
+                    $"QuickBooks rejected the query (status {status.Code}): {status.Message}");
+            }
+            var parsed = Parse(entity, xml);
+            return new ChunkedResult(parsed.Rows, parsed.MaxModified, null);
+        }
+        catch (Exception ex)
         {
             return new ChunkedResult(new List<Dictionary<string, object?>>(), null,
-                $"QuickBooks rejected the query (status {status.Code}): {status.Message}");
+                $"full query failed: {(ex is QbAgentException qex ? qex.Message : ex.Message)}");
         }
-        var parsed = Parse(entity, xml);
-        return new ChunkedResult(parsed.Rows, parsed.MaxModified, null);
     }
 
     /// <summary>
@@ -98,18 +112,81 @@ public static class QbPuller
     /// (iterator unsupported/misbehaving), re-runs as one unchunked query so
     /// chunking can never silently truncate the data set.
     /// </summary>
-    public static ChunkedResult PullChunked(QbSession session, string entity, Action<string> log)
+    /// <summary>
+    /// Pull with a shrinking-chunk retry ladder: 100 → 10 → 1 records per
+    /// chunk. Big chunks are fast; when a corrupt record (invalid byte in
+    /// company data) crashes QB's serializer, smaller chunks isolate it, and
+    /// at chunk size 1 the failure index identifies THE record — which a
+    /// names-only probe then tries to name so the user can fix it in QB.
+    /// </summary>
+    public static ChunkedResult PullResilient(QbSession session, string entity, Action<string> log)
+    {
+        ChunkedResult? last = null;
+        foreach (var size in new[] { 100, 10, 1 })
+        {
+            last = PullChunked(session, entity, log, size);
+            if (last.Error is null) return last;
+            log($"Pull {entity}: retrying with chunk size {(size == 100 ? 10 : 1)} to isolate the failing record…");
+            if (size == 1) break;
+        }
+
+        // Failed even one-by-one: last.Rows.Count records succeeded, so the
+        // culprit is record #(count+1) in QB's default sort order. Try to
+        // name it with a names-only query (tiny fields usually dodge the bad
+        // byte — unless the name itself carries it).
+        var index = last!.Rows.Count;
+        string culprit;
+        try
+        {
+            var names = FetchNamesOnly(session, entity);
+            culprit = index < names.Count
+                ? $"\"{names[index]}\" (record {index + 1})"
+                : $"record {index + 1}";
+        }
+        catch
+        {
+            culprit = $"record {index + 1} (the corrupt byte may be in its name — QuickBooks could not even list names)";
+        }
+        return last with
+        {
+            Error = $"{last.Error} — the corrupt record is {culprit} in QuickBooks' default sort order. " +
+                    "Open it in QuickBooks, retype any pasted/special characters (names, addresses, notes), save, and sync again.",
+        };
+    }
+
+    private static List<string> FetchNamesOnly(QbSession session, string entity)
+    {
+        var xml = session.RunRequest(ms =>
+        {
+            dynamic q = AppendQuery(ms, entity);
+            q.IncludeRetElementList.Add("FullName");
+        });
+        var status = ReadRsStatus(xml);
+        if (status.Severity == "Error") throw new QbAgentException(status.Message);
+        return XDocument.Parse(xml)
+            .Descendants()
+            .Where(e => e.Name.LocalName.EndsWith("Ret"))
+            .Select(e => e.Element("FullName")?.Value ?? e.Element("Name")?.Value ?? "?")
+            .ToList();
+    }
+
+    public static ChunkedResult PullChunked(QbSession session, string entity, Action<string> log, int chunkSize)
     {
         // AccountQueryRq does not support iterators at all — plain query.
         if (entity == "accounts")
         {
-            return PullFull(session, entity);
+            return PullFullSafe(session, entity);
         }
 
         var all = new List<Dictionary<string, object?>>();
         DateTimeOffset? max = null;
         string? iteratorId = null;
         var chunkIndex = 0;
+        // Runtime-probed "Start" value: try each candidate until QB accepts
+        // one (wrong values come back as status errors, e.g. 3150 asking for
+        // the iteratorID a Continue would need). Cached once discovered.
+        var startCandidates = _itStartValue.HasValue ? new[] { _itStartValue.Value } : ItStartCandidates;
+        var startCandidateIdx = 0;
 
         while (true)
         {
@@ -118,19 +195,20 @@ public static class QbPuller
             try
             {
                 var currentIteratorId = iteratorId;
+                var startValue = startCandidates[startCandidateIdx];
                 xml = session.RunRequest(ms =>
                 {
                     dynamic q = AppendQuery(ms, entity);
                     if (currentIteratorId is null)
                     {
-                        q.iterator.SetValue(ItStart);
+                        q.iterator.SetValue(startValue);
                     }
                     else
                     {
                         q.iterator.SetValue(ItContinue);
                         q.iteratorID.SetValue(currentIteratorId);
                     }
-                    SetMaxReturned(q, entity, ChunkSize);
+                    SetMaxReturned(q, entity, chunkSize);
                 });
             }
             catch (Exception ex)
@@ -145,16 +223,33 @@ public static class QbPuller
             var status = ReadRsStatus(xml);
             if (status.Severity == "Error")
             {
+                if (iteratorId is null && startCandidateIdx < startCandidates.Length - 1)
+                {
+                    // Wrong Start candidate — try the next one.
+                    log($"Pull {entity}: iterator value {startCandidates[startCandidateIdx]} rejected (status {status.Code}: {status.Message}) — trying next candidate.");
+                    startCandidateIdx++;
+                    chunkIndex--;
+                    continue;
+                }
                 if (iteratorId is null)
                 {
-                    // First chunk rejected (iterator form not accepted here) —
-                    // fall back to the plain unchunked query.
+                    // No candidate accepted — plain unchunked query.
                     log($"Pull {entity}: chunked query rejected (status {status.Code}: {status.Message}) — falling back to one full query.");
-                    return PullFull(session, entity);
+                    return PullFullSafe(session, entity);
                 }
                 var message = $"chunk {chunkIndex} (after {all.Count} records) rejected by QuickBooks (status {status.Code}): {status.Message}";
                 log($"Pull {entity}: {message}");
                 return new ChunkedResult(all, max, message);
+            }
+
+            if (iteratorId is null)
+            {
+                // This Start value worked — remember it for every later pull.
+                if (_itStartValue != startCandidates[startCandidateIdx])
+                {
+                    _itStartValue = startCandidates[startCandidateIdx];
+                    log($"Pull {entity}: iterator Start value = {_itStartValue} confirmed.");
+                }
             }
 
             var parsed = Parse(entity, xml);
@@ -174,10 +269,10 @@ public static class QbPuller
                 // clearly truncated, and an EMPTY first page is just as
                 // suspicious (a misunderstood iterator flag can yield 0 rows
                 // with status 0) — verify either way with one plain query.
-                if (parsed.Rows.Count >= ChunkSize || parsed.Rows.Count == 0)
+                if (parsed.Rows.Count >= chunkSize || parsed.Rows.Count == 0)
                 {
                     log($"Pull {entity}: iterator inactive ({parsed.Rows.Count} rows in chunk 1) — verifying with one full query.");
-                    return PullFull(session, entity);
+                    return PullFullSafe(session, entity);
                 }
                 return new ChunkedResult(all, max, null);
             }

@@ -126,8 +126,7 @@ public static class QbPuller
         {
             last = PullChunked(session, entity, log, size);
             if (last.Error is null) return last;
-            log($"Pull {entity}: retrying with chunk size {(size == 100 ? 10 : 1)} to isolate the failing record…");
-            if (size == 1) break;
+            if (size != 1) log($"Pull {entity}: retrying with chunk size {(size == 100 ? 10 : 1)} to isolate the failing record…");
         }
 
         // Failed even one-by-one: last.Rows.Count records succeeded, so the
@@ -147,6 +146,7 @@ public static class QbPuller
         {
             culprit = $"record {index + 1} (the corrupt byte may be in its name — QuickBooks could not even list names)";
         }
+        log($"Pull {entity}: corrupt record identified — {culprit}.");
         return last with
         {
             Error = $"{last.Error} — the corrupt record is {culprit} in QuickBooks' default sort order. " +

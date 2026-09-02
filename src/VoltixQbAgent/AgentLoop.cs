@@ -82,8 +82,13 @@ public sealed class AgentLoop
                     ? (CompanyGateOk ? "Connected — QuickBooks OK" : "Connected — WRONG COMPANY FILE")
                     : "Connected — QuickBooks not reachable");
 
-                // Phase Q2/Q3 slot in HERE, only when the gate passes:
-                //   if (CompanyGateOk) { await RunPullsAsync(...); await DrainOutboxAsync(...); }
+                // Work only behind the identity gate: syncing the wrong
+                // company's data is worse than syncing nothing.
+                if (CompanyGateOk && OutboxPending > 0)
+                {
+                    await ProcessWorkAsync(client, ct);
+                    SetStatus("Connected — QuickBooks OK");
+                }
             }
             catch (VoltixApiException ex)
             {
@@ -105,6 +110,76 @@ public sealed class AgentLoop
         }
         SetStatus("Stopped");
         Log.Info("Agent loop stopped.");
+    }
+
+    private async Task ProcessWorkAsync(VoltixClient client, CancellationToken ct)
+    {
+        var claim = await client.ClaimWorkAsync(4, ct);
+        foreach (var job in claim.Jobs)
+        {
+            if (ct.IsCancellationRequested) return;
+            if (job.Kind.StartsWith("pull.", StringComparison.Ordinal))
+            {
+                await RunPullJobAsync(client, job, ct);
+            }
+            else
+            {
+                Log.Warn($"Unknown job kind \"{job.Kind}\" — reporting as failed.");
+                await client.ReportWorkResultAsync(job.Id, false, null, $"Agent does not support job kind {job.Kind}", ct);
+            }
+        }
+    }
+
+    private async Task RunPullJobAsync(VoltixClient client, WorkJob job, CancellationToken ct)
+    {
+        var entity = job.Kind["pull.".Length..];
+        var full = job.Payload.TryGetProperty("full", out var f) && f.ValueKind == System.Text.Json.JsonValueKind.True;
+        DateTimeOffset? watermark = null;
+        if (!full && job.Payload.TryGetProperty("watermark", out var w) && w.ValueKind == System.Text.Json.JsonValueKind.String
+            && DateTimeOffset.TryParse(w.GetString(), out var parsed))
+        {
+            watermark = parsed;
+        }
+
+        SetStatus($"Syncing {entity}…");
+        Log.Info($"Pull {entity} started ({(full ? "full" : watermark.HasValue ? $"delta since {watermark:u}" : "first sync")}).");
+        try
+        {
+            // Short QB session on an STA thread: one query, then closed —
+            // users keep working in QuickBooks while we parse and upload.
+            var (xml, error) = RunSta(() => {
+                using var session = QbSession.Open(
+                    string.IsNullOrWhiteSpace(_config.CompanyFilePath) ? null : _config.CompanyFilePath);
+                return QbPuller.BuildQueryXml(session, entity);
+            });
+            if (error != null) throw new QbAgentException(error);
+
+            var parsed2 = QbPuller.Parse(entity, xml!);
+            var rows = QbPuller.FilterByWatermark(parsed2.Rows, watermark);
+            Log.Info($"Pull {entity}: {parsed2.Rows.Count} in QuickBooks, {rows.Count} to sync.");
+
+            for (var i = 0; i < rows.Count; i += 150)
+            {
+                ct.ThrowIfCancellationRequested();
+                await client.UpsertRowsAsync(entity, rows.Skip(i).Take(150), ct);
+            }
+
+            await client.ReportWorkResultAsync(job.Id, true,
+                new { entity, count = rows.Count, watermark = parsed2.MaxModified?.ToString("o") }, null, ct);
+            Log.Info($"Pull {entity} done — {rows.Count} rows synced.");
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            Log.Error($"Pull {entity} failed: {ex.Message}");
+            try
+            {
+                await client.ReportWorkResultAsync(job.Id, false, null, ex.Message, ct);
+            }
+            catch (Exception reportEx)
+            {
+                Log.Error($"Could not report failure to Voltix: {reportEx.Message}");
+            }
+        }
     }
 
     /// <summary>Open a short QB session on an STA thread, run CompanyQuery,

@@ -62,6 +62,11 @@ public sealed class VoltixClient : IDisposable
             new { success, result, error }, ct);
     }
 
+    public async Task UpsertRowsAsync(string entity, IEnumerable<Dictionary<string, object?>> rows, CancellationToken ct = default)
+    {
+        await PostAsync<BaseResponse>($"api/qb-agent/upsert/{entity}", new { rows }, ct);
+    }
+
     private async Task<T> PostAsync<T>(string path, object body, CancellationToken ct) where T : BaseResponse
     {
         var resp = await _http.PostAsJsonAsync(path, body, ct);

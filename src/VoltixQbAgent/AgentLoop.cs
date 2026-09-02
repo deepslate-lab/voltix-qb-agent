@@ -145,28 +145,43 @@ public sealed class AgentLoop
         Log.Info($"Pull {entity} started ({(full ? "full" : watermark.HasValue ? $"delta since {watermark:u}" : "first sync")}).");
         try
         {
-            // Short QB session on an STA thread: one query, then closed —
-            // users keep working in QuickBooks while we parse and upload.
-            var (xml, error) = RunSta(() => {
+            // One QB session on an STA thread for the whole chunked pull
+            // (iterators are session-scoped); closed before uploading — users
+            // keep working in QuickBooks throughout.
+            var (result, error) = RunSta(() =>
+            {
                 using var session = QbSession.Open(
                     string.IsNullOrWhiteSpace(_config.CompanyFilePath) ? null : _config.CompanyFilePath);
-                return QbPuller.BuildQueryXml(session, entity);
+                session.NegotiateQbXmlVersion();
+                return QbPuller.PullChunked(session, entity, Log.Info);
             });
             if (error != null) throw new QbAgentException(error);
 
-            var parsed2 = QbPuller.Parse(entity, xml!);
-            var rows = QbPuller.FilterByWatermark(parsed2.Rows, watermark);
-            Log.Info($"Pull {entity}: {parsed2.Rows.Count} in QuickBooks, {rows.Count} to sync.");
+            var rows = QbPuller.FilterByWatermark(result!.Rows, watermark);
+            Log.Info($"Pull {entity}: {result.Rows.Count} fetched, {rows.Count} to sync{(result.Error != null ? " (pull INCOMPLETE)" : "")}.");
 
+            // Upload whatever was fetched even when a chunk failed — upserts
+            // are idempotent and the watermark only advances on full success,
+            // so partial progress is pure gain.
             for (var i = 0; i < rows.Count; i += 150)
             {
                 ct.ThrowIfCancellationRequested();
                 await client.UpsertRowsAsync(entity, rows.Skip(i).Take(150), ct);
             }
 
-            await client.ReportWorkResultAsync(job.Id, true,
-                new { entity, count = rows.Count, watermark = parsed2.MaxModified?.ToString("o") }, null, ct);
-            Log.Info($"Pull {entity} done — {rows.Count} rows synced.");
+            if (result.Error != null)
+            {
+                await client.ReportWorkResultAsync(job.Id, false, null,
+                    $"Incomplete: {result.Error}. {rows.Count} records fetched before the failure were still synced. " +
+                    "The failing record likely contains an invalid character — fix it in QuickBooks and sync again.", ct);
+                Log.Warn($"Pull {entity} incomplete — {rows.Count} rows synced before the failure.");
+            }
+            else
+            {
+                await client.ReportWorkResultAsync(job.Id, true,
+                    new { entity, count = rows.Count, watermark = result.MaxModified?.ToString("o") }, null, ct);
+                Log.Info($"Pull {entity} done — {rows.Count} rows synced.");
+            }
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {

@@ -25,8 +25,16 @@ namespace VoltixQbAgent.QuickBooks;
 public sealed class QbSession : IDisposable
 {
     public const string AppName = "Voltix QB Agent";
+
+    /// <summary>Fallback when negotiation fails — the proven-safe floor.</summary>
     public const int QbXmlMajorVersion = 13;
     public const int QbXmlMinorVersion = 0;
+
+    /// <summary>Negotiated per session via HostQuery. Newer specs (16.0 on QB
+    /// 2022+) handle extended/unicode characters that make older versions die
+    /// with UTFDataFormatException / SAXParseException on large responses.</summary>
+    public int ActiveMajor { get; private set; } = QbXmlMajorVersion;
+    public int ActiveMinor { get; private set; } = QbXmlMinorVersion;
 
     private const int CtLocalQBD = 1;   // ENConnectionType.ctLocalQBD
     private const int OmDontCare = 2;   // ENOpenMode.omDontCare
@@ -84,7 +92,7 @@ public sealed class QbSession : IDisposable
             throw new QbAgentException("QuickBooks session is not open.");
         try
         {
-            dynamic msgSet = _manager.CreateMsgSetRequest("US", QbXmlMajorVersion, QbXmlMinorVersion);
+            dynamic msgSet = _manager.CreateMsgSetRequest("US", ActiveMajor, ActiveMinor);
             msgSet.Attributes.OnError = RoeStop;
             appendRequest(msgSet);
             dynamic response = _manager.DoRequests(msgSet);
@@ -93,6 +101,40 @@ public sealed class QbSession : IDisposable
         catch (Exception ex)
         {
             throw Translate(ex);
+        }
+    }
+
+    /// <summary>Ask QuickBooks which qbXML versions it supports (HostQuery,
+    /// issued at the safe floor version) and adopt the highest known one.
+    /// Best-effort — on any failure the session stays at the floor.</summary>
+    public void NegotiateQbXmlVersion()
+    {
+        try
+        {
+            var xml = RunRequest(ms => ms.AppendHostQueryRq());
+            var doc = System.Xml.Linq.XDocument.Parse(xml);
+            var supported = doc.Descendants("SupportedQBXMLVersion")
+                .Select(e => e.Value)
+                .Select(v => Version.TryParse(v.Contains('.') ? v : v + ".0", out var parsed) ? parsed : null)
+                .Where(v => v != null)
+                .Select(v => v!)
+                .ToList();
+            // Cap at 16.0 — the newest spec this agent's requests are written
+            // against.
+            var best = supported
+                .Where(v => v.Major >= QbXmlMajorVersion && v.Major <= 16)
+                .OrderByDescending(v => v)
+                .FirstOrDefault();
+            if (best != null)
+            {
+                ActiveMajor = best.Major;
+                ActiveMinor = best.Minor;
+                Log.Info($"qbXML version negotiated: {ActiveMajor}.{ActiveMinor} (host supports: {string.Join(", ", supported.Select(v => v.ToString(2)))})");
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"qbXML version negotiation failed, staying at {QbXmlMajorVersion}.{QbXmlMinorVersion}: {ex.Message}");
         }
     }
 

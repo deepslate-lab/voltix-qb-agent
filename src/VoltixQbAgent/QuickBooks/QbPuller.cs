@@ -16,14 +16,123 @@ public static class QbPuller
 {
     public sealed record ParseResult(List<Dictionary<string, object?>> Rows, DateTimeOffset? MaxModified);
 
-    public static string BuildQueryXml(QbSession session, string entity) => entity switch
+    /// <summary>Rows fetched so far + error info when a chunk failed midway —
+    /// the caller uploads what it has (idempotent) and reports the failure
+    /// without advancing the watermark.</summary>
+    public sealed record ChunkedResult(List<Dictionary<string, object?>> Rows, DateTimeOffset? MaxModified, string? Error);
+
+    private const int ChunkSize = 100;
+    private const int ItContinue = 0; // ENIteratorType
+    private const int ItStart = 1;
+
+    private static dynamic AppendQuery(dynamic msgSet, string entity) => entity switch
     {
-        "customers" => session.RunRequest(ms => ms.AppendCustomerQueryRq()),
-        "vendors" => session.RunRequest(ms => ms.AppendVendorQueryRq()),
-        "accounts" => session.RunRequest(ms => ms.AppendAccountQueryRq()),
-        "items" => session.RunRequest(ms => ms.AppendItemQueryRq()),
+        "customers" => msgSet.AppendCustomerQueryRq(),
+        "vendors" => msgSet.AppendVendorQueryRq(),
+        "accounts" => msgSet.AppendAccountQueryRq(),
+        "items" => msgSet.AppendItemQueryRq(),
         _ => throw new QbAgentException($"Unknown pull entity: {entity}"),
     };
+
+    private static void SetMaxReturned(dynamic query, string entity, int max)
+    {
+        switch (entity)
+        {
+            case "customers": query.ORCustomerListQuery.CustomerListFilter.MaxReturned.SetValue(max); break;
+            case "vendors": query.ORVendorListQuery.VendorListFilter.MaxReturned.SetValue(max); break;
+            case "accounts": query.ORAccountListQuery.AccountListFilter.MaxReturned.SetValue(max); break;
+            case "items": query.ORListQueryWithOwnerIDAndClass.ListWithClassFilter.MaxReturned.SetValue(max); break;
+        }
+    }
+
+    public static string BuildQueryXml(QbSession session, string entity) =>
+        session.RunRequest(ms => AppendQuery(ms, entity));
+
+    /// <summary>Iterator/attribute info from a chunk's *QueryRs element.</summary>
+    private static (string? IteratorId, int Remaining) ReadIteratorAttrs(string xml)
+    {
+        var doc = XDocument.Parse(xml);
+        var rs = doc.Descendants().FirstOrDefault(e => e.Name.LocalName.EndsWith("QueryRs"));
+        var id = rs?.Attribute("iteratorID")?.Value;
+        var remaining = int.TryParse(rs?.Attribute("iteratorRemainingCount")?.Value, out var n) ? n : 0;
+        return (string.IsNullOrEmpty(id) ? null : id, remaining);
+    }
+
+    /// <summary>
+    /// Pull an entity in iterator chunks inside ONE session (iterators are
+    /// session-scoped). Small responses avoid the giant-response encoding
+    /// failures (UTFDataFormatException/SAXParseException) that corrupt
+    /// characters in company data cause, and when a chunk still fails, only
+    /// that chunk dies — with a position hint — instead of the whole pull.
+    ///
+    /// Safety degrade: if the first chunk comes back full with NO iteratorID
+    /// (iterator unsupported/misbehaving), re-runs as one unchunked query so
+    /// chunking can never silently truncate the data set.
+    /// </summary>
+    public static ChunkedResult PullChunked(QbSession session, string entity, Action<string> log)
+    {
+        var all = new List<Dictionary<string, object?>>();
+        DateTimeOffset? max = null;
+        string? iteratorId = null;
+        var chunkIndex = 0;
+
+        while (true)
+        {
+            chunkIndex++;
+            string xml;
+            try
+            {
+                var currentIteratorId = iteratorId;
+                xml = session.RunRequest(ms =>
+                {
+                    dynamic q = AppendQuery(ms, entity);
+                    if (currentIteratorId is null)
+                    {
+                        q.iterator.SetValue(ItStart);
+                    }
+                    else
+                    {
+                        q.iterator.SetValue(ItContinue);
+                        q.iteratorID.SetValue(currentIteratorId);
+                    }
+                    SetMaxReturned(q, entity, ChunkSize);
+                });
+            }
+            catch (Exception ex)
+            {
+                var message = $"chunk {chunkIndex} (after {all.Count} records) failed: {(ex is QbAgentException qex ? qex.Message : ex.Message)}";
+                log($"Pull {entity}: {message}");
+                return new ChunkedResult(all, max, message);
+            }
+
+            var parsed = Parse(entity, xml);
+            all.AddRange(parsed.Rows);
+            if (parsed.MaxModified.HasValue && (!max.HasValue || parsed.MaxModified > max)) max = parsed.MaxModified;
+
+            var (nextId, remaining) = ReadIteratorAttrs(xml);
+
+            if (iteratorId is null && nextId is null)
+            {
+                // No iterator support detected. If we clearly got a truncated
+                // first page, redo as a single unchunked query — never trust
+                // MaxReturned without an iterator to continue from.
+                if (parsed.Rows.Count >= ChunkSize)
+                {
+                    log($"Pull {entity}: iterator not supported here — falling back to one full query.");
+                    var fullXml = BuildQueryXml(session, entity);
+                    var full = Parse(entity, fullXml);
+                    return new ChunkedResult(full.Rows, full.MaxModified, null);
+                }
+                return new ChunkedResult(all, max, null);
+            }
+
+            if (nextId is null || remaining <= 0)
+            {
+                return new ChunkedResult(all, max, null);
+            }
+            iteratorId = nextId;
+        }
+    }
 
     public static ParseResult Parse(string entity, string xml)
     {

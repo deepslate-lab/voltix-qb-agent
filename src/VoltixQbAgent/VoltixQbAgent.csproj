@@ -12,7 +12,7 @@
          publish BOTH win-x86 and win-x64 — run whichever matches the QB on
          the machine (the error message says which to try). -->
     <AssemblyName>VoltixQbAgent</AssemblyName>
-    <Version>0.2.0</Version>
+    <Version>0.2.1</Version>
     <Description>Voltix QuickBooks Enterprise Desktop sync agent</Description>
   </PropertyGroup>
 

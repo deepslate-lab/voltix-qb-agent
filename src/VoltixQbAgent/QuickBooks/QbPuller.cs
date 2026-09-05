@@ -134,10 +134,11 @@ public static class QbPuller
         // name it with a names-only query (tiny fields usually dodge the bad
         // byte — unless the name itself carries it).
         var index = last!.Rows.Count;
+        List<string>? names = null;
         string culprit;
         try
         {
-            var names = FetchNamesOnly(session, entity);
+            names = FetchNamesOnly(session, entity);
             culprit = index < names.Count
                 ? $"\"{names[index]}\" (record {index + 1})"
                 : $"record {index + 1}";
@@ -147,11 +148,81 @@ public static class QbPuller
             culprit = $"record {index + 1} (the corrupt byte may be in its name — QuickBooks could not even list names)";
         }
         log($"Pull {entity}: corrupt record identified — {culprit}.");
+
+        // One corrupt record must not hold the rest of the list hostage:
+        // iterators can't skip, but a by-name query fetches exactly one
+        // record — so pull everything after the culprit individually,
+        // skipping any further corrupt ones the same way.
+        if (names != null && index < names.Count && SupportsByNameFetch(entity))
+        {
+            var rows = new List<Dictionary<string, object?>>(last.Rows);
+            var max = last.MaxModified;
+            var corrupt = new List<string> { names[index] };
+            var total = names.Count - index - 1;
+            log($"Pull {entity}: skipping the corrupt record and recovering the remaining {total} by name…");
+            for (var i = index + 1; i < names.Count; i++)
+            {
+                var one = FetchOneByName(session, entity, names[i]);
+                if (one.Error != null)
+                {
+                    corrupt.Add(names[i]);
+                    log($"Pull {entity}: \"{names[i]}\" (record {i + 1}) is also corrupt — skipped.");
+                    continue;
+                }
+                rows.AddRange(one.Rows);
+                if (one.MaxModified.HasValue && (!max.HasValue || one.MaxModified > max)) max = one.MaxModified;
+                if ((i - index) % 200 == 0) log($"Pull {entity}: by-name recovery {i - index}/{total}…");
+            }
+            log($"Pull {entity}: by-name recovery finished — {rows.Count - last.Rows.Count} recovered, {corrupt.Count} corrupt skipped.");
+            var corruptDesc = corrupt.Count <= 10
+                ? string.Join(", ", corrupt.Select(n => $"\"{n}\""))
+                : string.Join(", ", corrupt.Take(10).Select(n => $"\"{n}\"")) + $" and {corrupt.Count - 10} more";
+            return new ChunkedResult(rows, max,
+                $"all records synced except {corrupt.Count} corrupt one{(corrupt.Count == 1 ? "" : "s")}: {corruptDesc}. " +
+                "Open each in QuickBooks, retype any pasted/special characters (name, addresses, notes, contacts), save, and sync again.");
+        }
+
         return last with
         {
             Error = $"{last.Error} — the corrupt record is {culprit} in QuickBooks' default sort order. " +
                     "Open it in QuickBooks, retype any pasted/special characters (names, addresses, notes), save, and sync again.",
         };
+    }
+
+    private static bool SupportsByNameFetch(string entity) =>
+        entity is "customers" or "vendors" or "items";
+
+    /// <summary>Fetch exactly one record by FullName. Never throws — a
+    /// serializer crash on this record's data comes back as an error result.</summary>
+    private static ChunkedResult FetchOneByName(QbSession session, string entity, string name)
+    {
+        try
+        {
+            var xml = session.RunRequest(ms =>
+            {
+                dynamic q = AppendQuery(ms, entity);
+                switch (entity)
+                {
+                    case "customers": q.ORCustomerListQuery.FullNameList.Add(name); break;
+                    case "vendors": q.ORVendorListQuery.FullNameList.Add(name); break;
+                    case "items": q.ORListQueryWithOwnerIDAndClass.FullNameList.Add(name); break;
+                    default: throw new QbAgentException($"By-name fetch not supported for {entity}");
+                }
+            });
+            var status = ReadRsStatus(xml);
+            if (status.Severity == "Error")
+            {
+                return new ChunkedResult(new List<Dictionary<string, object?>>(), null,
+                    $"QuickBooks rejected the by-name query (status {status.Code}): {status.Message}");
+            }
+            var parsed = Parse(entity, xml);
+            return new ChunkedResult(parsed.Rows, parsed.MaxModified, null);
+        }
+        catch (Exception ex)
+        {
+            return new ChunkedResult(new List<Dictionary<string, object?>>(), null,
+                ex is QbAgentException qex ? qex.Message : ex.Message);
+        }
     }
 
     private static List<string> FetchNamesOnly(QbSession session, string entity)

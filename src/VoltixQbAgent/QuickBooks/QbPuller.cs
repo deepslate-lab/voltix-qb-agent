@@ -29,6 +29,17 @@ public static class QbPuller
     private static readonly int[] ItStartCandidates = { 2, 0 };
     private static int? _itStartValue;
 
+    // QB list queries return ACTIVE records only by default, so a record
+    // deactivated in QB after its first sync would never propagate. The
+    // ENActiveStatus value for "All" is another undocumented late-binding
+    // constant — probed at runtime and VALIDATED by record counts: a
+    // candidate is only trusted outright when it returns MORE records than
+    // the unfiltered (active-only) baseline, so a wrong value can never
+    // silently narrow the sync. null = not probed yet; -1 = unsupported,
+    // stay active-only.
+    private static readonly int[] ActiveStatusCandidates = { 2, 1, 3 };
+    private static int? _activeStatusAll;
+
     private static dynamic AppendQuery(dynamic msgSet, string entity) => entity switch
     {
         "customers" => msgSet.AppendCustomerQueryRq(),
@@ -93,7 +104,11 @@ public static class QbPuller
     {
         try
         {
-            var xml = BuildQueryXml(session, entity);
+            var xml = session.RunRequest(ms =>
+            {
+                dynamic q = AppendQuery(ms, entity);
+                if (ActiveStatusAllValue is int asv) TrySetActiveStatus(q, entity, asv);
+            });
             var status = ReadRsStatus(xml);
             if (status.Severity == "Error")
             {
@@ -130,6 +145,7 @@ public static class QbPuller
     /// </summary>
     public static ChunkedResult PullResilient(QbSession session, string entity, Action<string> log)
     {
+        EnsureActiveStatusProbed(session, entity, log);
         ChunkedResult? last = null;
         foreach (var size in new[] { 100, 10, 1 })
         {
@@ -147,7 +163,7 @@ public static class QbPuller
         string culprit;
         try
         {
-            names = FetchNamesOnly(session, entity);
+            names = FetchNamesOnly(session, entity, ActiveStatusAllValue);
             culprit = index < names.Count
                 ? $"\"{names[index]}\" (record {index + 1})"
                 : $"record {index + 1}";
@@ -217,6 +233,7 @@ public static class QbPuller
                     case "items": q.ORListQueryWithOwnerIDAndClass.FullNameList.Add(name); break;
                     default: throw new QbAgentException($"By-name fetch not supported for {entity}");
                 }
+                if (ActiveStatusAllValue is int asv) TrySetActiveStatus(q, entity, asv);
             });
             var status = ReadRsStatus(xml);
             if (status.Severity == "Error")
@@ -234,11 +251,12 @@ public static class QbPuller
         }
     }
 
-    private static List<string> FetchNamesOnly(QbSession session, string entity)
+    private static List<string> FetchNamesOnly(QbSession session, string entity, int? activeStatus = null)
     {
         var xml = session.RunRequest(ms =>
         {
             dynamic q = AppendQuery(ms, entity);
+            if (activeStatus.HasValue) TrySetActiveStatus(q, entity, activeStatus.Value);
             q.IncludeRetElementList.Add("FullName");
         });
         var status = ReadRsStatus(xml);
@@ -248,6 +266,88 @@ public static class QbPuller
             .Where(e => e.Name.LocalName.EndsWith("Ret"))
             .Select(e => e.Element("FullName")?.Value ?? e.Element("Name")?.Value ?? "?")
             .ToList();
+    }
+
+    /// <summary>Set the ActiveStatus filter wherever this entity's query
+    /// keeps it. False = no known member accepted it (query unchanged).</summary>
+    private static bool TrySetActiveStatus(dynamic q, string entity, int value)
+    {
+        try
+        {
+            switch (entity)
+            {
+                case "customers": q.ORCustomerListQuery.CustomerListFilter.ActiveStatus.SetValue(value); return true;
+                case "vendors": q.ORVendorListQuery.VendorListFilter.ActiveStatus.SetValue(value); return true;
+                case "accounts": q.ORAccountListQuery.AccountListFilter.ActiveStatus.SetValue(value); return true;
+                case "items": q.ORListQueryWithOwnerIDAndClass.ListWithClassFilter.ActiveStatus.SetValue(value); return true;
+            }
+        }
+        catch { /* fall through to the generic shapes */ }
+        try { q.ActiveStatus.SetValue(value); return true; } catch { }
+        try { q.ORListQuery.ListFilter.ActiveStatus.SetValue(value); return true; } catch { }
+        try { q.ORListQueryWithOwnerIDAndClass.ListWithClassFilter.ActiveStatus.SetValue(value); return true; } catch { }
+        return false;
+    }
+
+    /// <summary>Effective probed value, or null when unknown/unsupported.</summary>
+    private static int? ActiveStatusAllValue =>
+        _activeStatusAll is int v && v >= 0 ? v : null;
+
+    /// <summary>Probe the ENActiveStatus "All" value once per process, on the
+    /// first entity whose query accepts the filter. A candidate returning
+    /// MORE names than the unfiltered baseline is definitely All (inactive
+    /// records included); if none exceeds it (no inactive records exist to
+    /// tell the values apart), the first accepted candidate is used — which
+    /// then behaves identically to today at worst.</summary>
+    private static void EnsureActiveStatusProbed(QbSession session, string entity, Action<string> log)
+    {
+        if (_activeStatusAll.HasValue) return;
+        try
+        {
+            // Does this entity's query even accept the filter? (Checked on a
+            // throwaway request so a no wastes nothing.)
+            var accepted = false;
+            session.RunRequest(ms =>
+            {
+                dynamic q = AppendQuery(ms, entity);
+                accepted = TrySetActiveStatus(q, entity, 0);
+                q.IncludeRetElementList.Add("FullName");
+            });
+            if (!accepted) return; // leave unset — another entity may probe later
+
+            var baseline = FetchNamesOnly(session, entity).Count;
+            int? best = null, tentative = null;
+            var bestCount = baseline;
+            foreach (var candidate in ActiveStatusCandidates)
+            {
+                try
+                {
+                    var count = FetchNamesOnly(session, entity, candidate).Count;
+                    if (count > bestCount) { best = candidate; bestCount = count; }
+                    else if (count == baseline) tentative ??= candidate;
+                }
+                catch { /* rejected value — next candidate */ }
+            }
+            if (best.HasValue)
+            {
+                _activeStatusAll = best.Value;
+                log($"ActiveStatus \"All\" value = {best.Value} confirmed ({baseline} active, {bestCount} total incl. inactive).");
+            }
+            else if (tentative.HasValue)
+            {
+                _activeStatusAll = tentative.Value;
+                log($"ActiveStatus value = {tentative.Value} accepted (counts equal — no inactive {entity} to tell candidates apart).");
+            }
+            else
+            {
+                _activeStatusAll = -1;
+                log("ActiveStatus filter rejected by QuickBooks — syncing active records only.");
+            }
+        }
+        catch (Exception ex)
+        {
+            log($"ActiveStatus probe failed ({ex.Message}) — syncing active records only this run.");
+        }
     }
 
     public static ChunkedResult PullChunked(QbSession session, string entity, Action<string> log, int chunkSize)
@@ -287,6 +387,7 @@ public static class QbPuller
                         q.iterator.SetValue(ItContinue);
                         q.iteratorID.SetValue(currentIteratorId);
                     }
+                    if (ActiveStatusAllValue is int asv) TrySetActiveStatus(q, entity, asv);
                     SetMaxReturned(q, entity, chunkSize);
                 });
             }

@@ -35,8 +35,17 @@ public static class QbPuller
         "vendors" => msgSet.AppendVendorQueryRq(),
         "accounts" => msgSet.AppendAccountQueryRq(),
         "items" => msgSet.AppendItemQueryRq(),
+        "currencies" => msgSet.AppendCurrencyQueryRq(),
+        "tax_groups" => msgSet.AppendItemSalesTaxQueryRq(),
+        "warehouses" => msgSet.AppendInventorySiteQueryRq(),
+        "price_levels" => msgSet.AppendPriceLevelQueryRq(),
         _ => throw new QbAgentException($"Unknown pull entity: {entity}"),
     };
+
+    /// <summary>List queries with no iterator support — small lists, pulled
+    /// with one status-checked query (accounts included).</summary>
+    private static bool IsNoIteratorEntity(string entity) =>
+        entity is "accounts" or "currencies" or "tax_groups" or "warehouses" or "price_levels";
 
     private static void SetMaxReturned(dynamic query, string entity, int max)
     {
@@ -243,8 +252,7 @@ public static class QbPuller
 
     public static ChunkedResult PullChunked(QbSession session, string entity, Action<string> log, int chunkSize)
     {
-        // AccountQueryRq does not support iterators at all — plain query.
-        if (entity == "accounts")
+        if (IsNoIteratorEntity(entity))
         {
             return PullFullSafe(session, entity);
         }
@@ -365,6 +373,10 @@ public static class QbPuller
             "vendors" => ParsePartners(doc, "VendorRet", "VendorAddress"),
             "accounts" => ParseAccounts(doc),
             "items" => ParseItems(doc),
+            "currencies" => ParseCurrencies(doc),
+            "tax_groups" => ParseTaxItems(doc),
+            "warehouses" => ParseInventorySites(doc),
+            "price_levels" => ParsePriceLevels(doc),
             _ => throw new QbAgentException($"Unknown pull entity: {entity}"),
         };
     }
@@ -396,6 +408,7 @@ public static class QbPuller
                 ["postal_code"] = addr?.Element("PostalCode")?.Value,
                 ["country"] = addr?.Element("Country")?.Value,
                 ["currency"] = ret.Element("CurrencyRef")?.Element("FullName")?.Value,
+                ["payment_terms"] = ret.Element("TermsRef")?.Element("FullName")?.Value,
                 ["is_active"] = ret.Element("IsActive")?.Value != "false",
                 ["_modified"] = modified?.ToString("o"),
             });
@@ -475,6 +488,116 @@ public static class QbPuller
                     ["_modified"] = modified?.ToString("o"),
                 });
             }
+        }
+        return new ParseResult(rows, max);
+    }
+
+    private static ParseResult ParseCurrencies(XDocument doc)
+    {
+        var rows = new List<Dictionary<string, object?>>();
+        DateTimeOffset? max = null;
+        foreach (var ret in doc.Descendants("CurrencyRet"))
+        {
+            var modified = ParseTime(ret.Element("TimeModified")?.Value);
+            Track(ref max, modified);
+            rows.Add(new Dictionary<string, object?>
+            {
+                ["list_id"] = ret.Element("ListID")?.Value,
+                ["name"] = ret.Element("Name")?.Value,
+                ["code"] = ret.Element("CurrencyCode")?.Value,
+                ["rate"] = Num(ret.Element("ExchangeRate")?.Value),
+                ["is_active"] = ret.Element("IsActive")?.Value != "false",
+                ["_modified"] = modified?.ToString("o"),
+            });
+        }
+        return new ParseResult(rows, max);
+    }
+
+    /// <summary>Sales tax ITEMS carry the actual rates (SalesTaxCodes are
+    /// just taxable/non-taxable flags, no rate — not synced).</summary>
+    private static ParseResult ParseTaxItems(XDocument doc)
+    {
+        var rows = new List<Dictionary<string, object?>>();
+        DateTimeOffset? max = null;
+        foreach (var ret in doc.Descendants("ItemSalesTaxRet"))
+        {
+            var modified = ParseTime(ret.Element("TimeModified")?.Value);
+            Track(ref max, modified);
+            rows.Add(new Dictionary<string, object?>
+            {
+                ["list_id"] = ret.Element("ListID")?.Value,
+                ["name"] = ret.Element("Name")?.Value,
+                ["description"] = ret.Element("ItemDesc")?.Value,
+                ["rate"] = Num(ret.Element("TaxRate")?.Value),
+                ["is_active"] = ret.Element("IsActive")?.Value != "false",
+                ["_modified"] = modified?.ToString("o"),
+            });
+        }
+        return new ParseResult(rows, max);
+    }
+
+    /// <summary>QB "inventory sites" (Advanced Inventory) → Voltix warehouses.
+    /// Without Advanced Inventory QB rejects the query — reported verbatim.</summary>
+    private static ParseResult ParseInventorySites(XDocument doc)
+    {
+        var rows = new List<Dictionary<string, object?>>();
+        DateTimeOffset? max = null;
+        foreach (var ret in doc.Descendants("InventorySiteRet"))
+        {
+            var modified = ParseTime(ret.Element("TimeModified")?.Value);
+            Track(ref max, modified);
+            var addr = ret.Element("SiteAddress");
+            var addrLines = new[] { "Addr1", "Addr2", "Addr3", "Addr4", "Addr5", "City", "State", "PostalCode" }
+                .Select(a => addr?.Element(a)?.Value?.Trim())
+                .Where(v => !string.IsNullOrEmpty(v));
+            rows.Add(new Dictionary<string, object?>
+            {
+                ["list_id"] = ret.Element("ListID")?.Value,
+                ["name"] = ret.Element("Name")?.Value,
+                ["address"] = string.Join("\n", addrLines),
+                ["contact"] = ret.Element("Contact")?.Value,
+                ["phone"] = ret.Element("Phone")?.Value,
+                ["email"] = ret.Element("Email")?.Value,
+                ["is_default"] = ret.Element("IsDefaultSite")?.Value == "true",
+                ["is_active"] = ret.Element("IsActive")?.Value != "false",
+                ["_modified"] = modified?.ToString("o"),
+            });
+        }
+        return new ParseResult(rows, max);
+    }
+
+    /// <summary>QB price levels → Voltix price lists. Per-item levels carry
+    /// custom prices (nested under "items"); fixed-percentage levels have no
+    /// per-item prices, only the percentage.</summary>
+    private static ParseResult ParsePriceLevels(XDocument doc)
+    {
+        var rows = new List<Dictionary<string, object?>>();
+        DateTimeOffset? max = null;
+        foreach (var ret in doc.Descendants("PriceLevelRet"))
+        {
+            var modified = ParseTime(ret.Element("TimeModified")?.Value);
+            Track(ref max, modified);
+            var items = new List<Dictionary<string, object?>>();
+            foreach (var it in ret.Descendants("PriceLevelPerItemRet"))
+            {
+                items.Add(new Dictionary<string, object?>
+                {
+                    ["item_list_id"] = it.Element("ItemRef")?.Element("ListID")?.Value,
+                    ["item_full_name"] = it.Element("ItemRef")?.Element("FullName")?.Value,
+                    ["custom_price"] = Num(it.Element("CustomPrice")?.Value),
+                    ["custom_percent"] = Num(it.Element("CustomPricePercent")?.Value),
+                });
+            }
+            rows.Add(new Dictionary<string, object?>
+            {
+                ["list_id"] = ret.Element("ListID")?.Value,
+                ["name"] = ret.Element("Name")?.Value,
+                ["type"] = ret.Element("PriceLevelType")?.Value,
+                ["fixed_percentage"] = Num(ret.Descendants("PriceLevelFixedPercentage").FirstOrDefault()?.Value),
+                ["items"] = items,
+                ["is_active"] = ret.Element("IsActive")?.Value != "false",
+                ["_modified"] = modified?.ToString("o"),
+            });
         }
         return new ParseResult(rows, max);
     }

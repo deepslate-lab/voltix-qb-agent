@@ -481,6 +481,7 @@ public static class QbPuller
                     ["description"] = desc,
                     ["barcode"] = ret.Element("BarCode")?.Element("BarCodeValue")?.Value,
                     ["item_type"] = itemType,
+                    ["tax_code"] = ret.Element("SalesTaxCodeRef")?.Element("FullName")?.Value,
                     ["sales_price"] = price,
                     ["purchase_cost"] = cost,
                     ["quantity_on_hand"] = Num(ret.Element("QuantityOnHand")?.Value),

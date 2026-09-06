@@ -147,14 +147,23 @@ public sealed class AgentLoop
         {
             // One QB session on an STA thread for the whole chunked pull
             // (iterators are session-scoped); closed before uploading — users
-            // keep working in QuickBooks throughout.
-            var (result, error) = RunSta(() =>
+            // keep working in QuickBooks throughout. The pull can run for
+            // minutes (corrupt-record recovery fetches records one by one),
+            // so keep heartbeating while it works — otherwise Voltix declares
+            // the agent offline mid-sync.
+            var staTask = Task.Run(() => RunSta(() =>
             {
                 using var session = QbSession.Open(
                     string.IsNullOrWhiteSpace(_config.CompanyFilePath) ? null : _config.CompanyFilePath);
                 session.NegotiateQbXmlVersion();
                 return QbPuller.PullResilient(session, entity, Log.Info);
-            });
+            }));
+            while (await Task.WhenAny(staTask, Task.Delay(TimeSpan.FromSeconds(45), ct)) != staTask)
+            {
+                try { await client.HeartbeatAsync(QbOpen, LastCompanySeen, ct); }
+                catch { /* best effort — the pull result is what matters */ }
+            }
+            var (result, error) = await staTask;
             if (error != null) throw new QbAgentException(error);
 
             var rows = QbPuller.FilterByWatermark(result!.Rows, watermark);

@@ -122,6 +122,10 @@ public sealed class AgentLoop
             {
                 await RunPullJobAsync(client, job, ct);
             }
+            else if (job.Kind == "post.invoice")
+            {
+                await RunInvoicePostJobAsync(client, job, ct);
+            }
             else
             {
                 Log.Warn($"Unknown job kind \"{job.Kind}\" — reporting as failed.");
@@ -203,6 +207,39 @@ public sealed class AgentLoop
             {
                 Log.Error($"Could not report failure to Voltix: {reportEx.Message}");
             }
+        }
+    }
+
+    private async Task RunInvoicePostJobAsync(VoltixClient client, WorkJob job, CancellationToken ct)
+    {
+        var refNo = job.Payload.TryGetProperty("ref_number", out var r) ? r.GetString() : "?";
+        SetStatus($"Posting invoice {refNo}…");
+        Log.Info($"Post invoice {refNo} started.");
+        try
+        {
+            var (result, error) = RunSta(() =>
+            {
+                using var session = QbSession.Open(
+                    string.IsNullOrWhiteSpace(_config.CompanyFilePath) ? null : _config.CompanyFilePath);
+                session.NegotiateQbXmlVersion();
+                return QbPoster.PostInvoice(session, job.Payload, Log.Info);
+            });
+            if (error != null) throw new QbAgentException(error);
+
+            await client.ReportWorkResultAsync(job.Id, true, new
+            {
+                txn_id = result!.TxnId,
+                ref_number = result.RefNumber,
+                qb_total = result.QbTotal,
+                already_existed = result.AlreadyExisted,
+            }, null, ct);
+            Log.Info($"Post invoice {refNo} done — TxnID {result.TxnId}{(result.AlreadyExisted ? " (pre-existing)" : "")}.");
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            Log.Error($"Post invoice {refNo} failed: {ex.Message}");
+            try { await client.ReportWorkResultAsync(job.Id, false, null, ex.Message, ct); }
+            catch (Exception reportEx) { Log.Error($"Could not report failure to Voltix: {reportEx.Message}"); }
         }
     }
 

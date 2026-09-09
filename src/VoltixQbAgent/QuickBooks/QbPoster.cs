@@ -63,7 +63,8 @@ public static class QbPoster
             throw new QbAgentException($"QuickBooks rejected the invoice (status {status.Code}): {status.Message}");
         }
         var ret = XDocument.Parse(xml).Descendants("InvoiceRet").FirstOrDefault()
-            ?? throw new QbAgentException("QuickBooks returned no InvoiceRet for the added invoice.");
+            ?? throw new QbAgentException(
+                $"QuickBooks returned no InvoiceRet for the added invoice (status {status.Code}, severity {status.Severity}: {status.Message}).");
         return new PostResult(
             ret.Element("TxnID")?.Value ?? "",
             ret.Element("RefNumber")?.Value ?? refNumber,
@@ -95,12 +96,17 @@ public static class QbPoster
             true);
     }
 
-    /// <summary>Status attributes live on the *Rs element (same convention as
-    /// the list queries — rejections are statuses, not exceptions).</summary>
+    /// <summary>Status attributes live on the request's *Rs element (same
+    /// convention as the list queries — rejections are statuses, not
+    /// exceptions). The OUTER QBXMLMsgsRs envelope also ends in "Rs" but
+    /// carries no status attributes — matching it first masked every real
+    /// rejection as Info (v0.2.9 bug: "no InvoiceRet" instead of QB's
+    /// actual error).</summary>
     private static (string Severity, string Code, string Message) ReadAddStatus(string xml)
     {
         var doc = XDocument.Parse(xml);
-        var rs = doc.Descendants().FirstOrDefault(e => e.Name.LocalName.EndsWith("Rs"));
+        var rs = doc.Descendants().FirstOrDefault(e =>
+            e.Name.LocalName.EndsWith("Rs") && e.Name.LocalName != "QBXMLMsgsRs");
         return (
             rs?.Attribute("statusSeverity")?.Value ?? "Info",
             rs?.Attribute("statusCode")?.Value ?? "0",

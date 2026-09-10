@@ -122,9 +122,9 @@ public sealed class AgentLoop
             {
                 await RunPullJobAsync(client, job, ct);
             }
-            else if (job.Kind == "post.invoice")
+            else if (job.Kind is "post.invoice" or "post.estimate")
             {
-                await RunInvoicePostJobAsync(client, job, ct);
+                await RunDocumentPostJobAsync(client, job, ct);
             }
             else
             {
@@ -210,11 +210,13 @@ public sealed class AgentLoop
         }
     }
 
-    private async Task RunInvoicePostJobAsync(VoltixClient client, WorkJob job, CancellationToken ct)
+    private async Task RunDocumentPostJobAsync(VoltixClient client, WorkJob job, CancellationToken ct)
     {
+        var estimate = job.Kind == "post.estimate";
+        var docWord = estimate ? "estimate" : "invoice";
         var refNo = job.Payload.TryGetProperty("ref_number", out var r) ? r.GetString() : "?";
-        SetStatus($"Posting invoice {refNo}…");
-        Log.Info($"Post invoice {refNo} started.");
+        SetStatus($"Posting {docWord} {refNo}…");
+        Log.Info($"Post {docWord} {refNo} started.");
         try
         {
             var (result, error) = RunSta(() =>
@@ -222,7 +224,9 @@ public sealed class AgentLoop
                 using var session = QbSession.Open(
                     string.IsNullOrWhiteSpace(_config.CompanyFilePath) ? null : _config.CompanyFilePath);
                 session.NegotiateQbXmlVersion();
-                return QbPoster.PostInvoice(session, job.Payload, Log.Info);
+                return estimate
+                    ? QbPoster.PostEstimate(session, job.Payload, Log.Info)
+                    : QbPoster.PostInvoice(session, job.Payload, Log.Info);
             });
             if (error != null) throw new QbAgentException(error);
 
@@ -232,12 +236,13 @@ public sealed class AgentLoop
                 ref_number = result.RefNumber,
                 qb_total = result.QbTotal,
                 already_existed = result.AlreadyExisted,
+                discount_item_list_id = result.DiscountItemListId,
             }, null, ct);
-            Log.Info($"Post invoice {refNo} done — TxnID {result.TxnId}{(result.AlreadyExisted ? " (pre-existing)" : "")}.");
+            Log.Info($"Post {docWord} {refNo} done — TxnID {result.TxnId}{(result.AlreadyExisted ? " (pre-existing)" : "")}.");
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            Log.Error($"Post invoice {refNo} failed: {ex.Message}");
+            Log.Error($"Post {docWord} {refNo} failed: {ex.Message}");
             try { await client.ReportWorkResultAsync(job.Id, false, null, ex.Message, ct); }
             catch (Exception reportEx) { Log.Error($"Could not report failure to Voltix: {reportEx.Message}"); }
         }
